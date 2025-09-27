@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: LGPL-3.0-or-later
 #
-# Copyright (C) 2025 Scott Shambarger
+# Copyright (C) 2025 Scott Shambarger v0.1.0
 #
 # TODO:
 #   SR_INTF: support patterns
@@ -218,38 +218,52 @@ setup_links() { # [ <names>...]
   done
 }
 
+rm_network() { # <name>
+  local name=$1 sn=() n args=()
+
+  get_subnets sn "$name"
+
+  for n in "${sn[@]}"; do
+    [[ $n =~ : ]] && args=(-6) || args=()
+    [[ $(ip 2>/dev/null "${args[@]}" route list "$n" dev "$SR_INTF") ]] ||
+      continue
+    echo "Removing host route $n dev $SR_INTF for network $name"
+    sudo ip route del "$n" dev "$SR_INTF"
+  done
+}
+
 rm_links() { # <names>...
-  local name sn=() n ip args=()
+  local name
 
-  if [[ $1 ]]; then
+  [[ $1 ]] && {
     for name in "$@"; do
-      get_subnets sn "$name"
-      for n in "${sn[@]}"; do
-        [[ $n =~ : ]] && args=(-6) || args=()
-        [[ $(ip 2>/dev/null "${args[@]}" route list "$n" dev "$SR_INTF") ]] ||
-          continue
-        echo "Removing host route $n dev $SR_INTF for network $name"
-        sudo ip route del "$n" dev "$SR_INTF"
-      done
+      rm_network "$name"
     done
-  else
+    return 0
+  }
 
-    ip &>/dev/null link show "$SR_INTF" && {
-      echo "Removing rootless link $SR_INTF"
-      podman unshare --rootless-netns ip 2>/dev/null link del "$SR_INTF"
-    }
+  ip &>/dev/null link show "$SR_INTF" && {
+    echo "Removing rootless link $SR_INTF"
+    podman unshare --rootless-netns ip 2>/dev/null link del "$SR_INTF"
+  }
 
-    podman &>/dev/null pod inspect "$SR_INFRA" && {
-      echo "Removing pod $SR_INFRA"
-      podman >/dev/null pod stop "$SR_INFRA" || :
-      podman >/dev/null pod rm "$SR_INFRA"
-    }
+  podman &>/dev/null pod inspect "$SR_INFRA" && {
+    echo "Removing pod $SR_INFRA"
+    podman >/dev/null pod stop "$SR_INFRA" || :
+    podman >/dev/null pod rm "$SR_INFRA"
+  }
 
-    podman &>/dev/null network inspect "$SR_NET" && {
-      echo "Removing podman network $SR_NET"
-      podman >/dev/null network rm "$SR_NET"
-    }
-  fi
+  podman &>/dev/null network inspect "$SR_NET" && {
+    echo "Removing podman network $SR_NET"
+    podman >/dev/null network rm "$SR_NET"
+  }
+
+  ip netns list | grep -q "$SR_NS" && {
+    echo "Removing namespace attachment $SR_NS"
+    sudo ip netns del "$SR_NS"
+  }
+
+  return 0
 }
 
 usage() {
