@@ -1,0 +1,280 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: LGPL-3.0-or-later
+#
+# Copyright (C) 2025 Scott Shambarger
+#
+# TODO:
+#   SR_INTF: support patterns
+#   SR_NET: use network interface name for links
+#   SR_NET: use gateway ip rather than 1 and 2
+#   SR_NET: honor mtu/metric/no_default_route/routes
+#
+# Script to create publically routable rootless podman networks
+#
+# Config:
+#
+# host (and rootless) interface name
+SR_INTF=${SR_INTF:-cni0}
+# podman network created to reserve route ips
+SR_NET=${SR_NET:-reserved}
+# rootless network namespace name
+SR_NS=${SR_NS:-"${USER}-rootless"}
+# pod created to pin rootless namespace
+SR_INFRA=${SR_INFRA:-rootless}
+#
+# Creates host interface $SR_INTF and routes for subnets in named podman
+# networks.  If $SR_NET exists, it is used to determine single vs
+# dual-stack networking (default: dual).  $SR_NET also determines the host
+# addresses for $SR_INTF and nexthop addresses for added routes.
+#
+# Theory:
+#
+#   The script creates a infrastructure pod named in $SR_INFRA to preserve
+#   the rootless namespace.
+#
+#   It then attaches the podman rootless namespace to $SR_NS
+#
+#   The script creates a virtual ethernet pair in the podman rootless
+#   network namespace, and moves one peer to the host.  The interface
+#   is named in $SR_INTF
+#
+#   It then assigns the veth pair two "unused" network ips from
+#   the network named in $SR_NET, and adds a default route to the host
+#   peer for the rootless network.
+#
+#   Finally, for any supplied podman network, it adds a host route to
+#   the rootless peer.
+#
+#   The script is idempotent, so can be run multiple times and will
+#   attempt to configure the network as designed.
+#
+# Requires:
+#   ip - to configure inet
+#   podman - to manage containers/networks
+#   jq - to parse config
+#   sudo - for privileged operations
+#
+# sudo command patterns required (for SR_NS=devel-rootless, SR_INTF=cni0):
+#
+#   ip ^netns attach devel-rootless [0-9]+$
+#   ip netns del devel-rootless
+#   ip ^-n devel-rootless link set cni0-peer name cni0 netns [^ ]+$
+#   ip ^addr add [0-9a-f:./]+ dev cni0$
+#   ip link set cni0 up
+#   ip ^route add [0-9a-f:./]+ via [0-9a-f:.]+ dev cni0$
+#   ip ^route del [0-9a-f:./]+ dev cni0$
+#
+
+set -e
+
+err() { echo >&2 "$*"; }
+die() { err "$*"; exit 1; }
+
+for cmd in jq ip podman sudo; do
+  command >/dev/null -v "$cmd" || die "$cmd command not found"
+done
+
+# set <var> array to <name>'s subnets
+get_subnets() { # <var> <name>
+  readarray -t "$1" < <(podman network inspect "$2" | \
+                        jq -r '.[0].subnets.[].subnet') || :
+  [[ $sn ]] || die "Unable to find subnet for network $2"
+}
+
+echo_ip() { # <ip> <quad>
+  if [[ $1 =~ : ]]; then
+    echo "${1%/*}$2/${1#*/}"
+  else
+    echo "${1%.*}.$2/${1#*/}"
+  fi
+}
+
+setup_gw() { # <subnet>...
+  local ip pid lns sn gw gws args=()
+
+  podman &>/dev/null inspect "$SR_INFRA" || {
+    echo "Creating pod $SR_INFRA to hold rootless netns"
+    # Use default network, $SR_NET needs to be unused by pasta"
+    podman >/dev/null pod create --name "$SR_INFRA" --network podman
+    podman >/dev/null pod start "$SR_INFRA"
+  }
+
+  while read -r pid; do
+    [[ $(ip netns identify "$pid") == "$SR_NS" ]] && break
+    ip netns list | grep -q "$SR_NS" && {
+      echo "Removing old namespace attachment $SR_NS"
+      sudo ip netns del "$SR_NS"
+    }
+    echo "Attaching namespace $SR_NS to rootless netns"
+    sudo ip netns attach "$SR_NS" "$pid"
+    break
+  done < <(podman unshare --rootless-netns sh -c 'echo $$; sleep 2')
+
+  ip &>/dev/null link show "$SR_INTF" && {
+    for sn in "$@"; do
+      [[ $sn =~ : ]] && args=(-6) || args=(-4)
+      ip=$(ip 2>/dev/null "${args[@]}" -j addr show dev "$SR_INTF" |
+             jq -r '.[0].addr_info[0] | .local + "/" + (.prefixlen|tostring)')
+      sn=$(echo_ip "$sn" 1)
+      [[ $sn == "$ip" ]] || {
+        echo "$SR_INTF is $ip, should be $sn - resetting"
+        pid=''
+      }
+    done
+    [[ $pid ]] && return
+  }
+
+  # remove any existing link, add new one
+  echo "Creating link+peer $SR_INTF in rootless netns"
+  podman unshare --rootless-netns <<- EOF
+	ip 2>/dev/null link del "$SR_INTF"
+	ip link add "$SR_INTF" type veth peer name "${SR_INTF}-peer"
+	EOF
+
+  # check host $SR_INTF was removed
+  ip &>/dev/null link show "$SR_INTF" &&
+    die "Host link $SR_INTF used by something other an rootless link $SR_INTF"
+
+  lns=$(ip netns identify $$)
+  [[ $lns ]] || die "Unable to discover name of default network namespace"
+  echo "Moving $SR_INTF peer to host"
+  sudo ip -n "$SR_NS" link set "${SR_INTF}-peer" name "$SR_INTF" netns "$lns"
+
+  for sn in "$@"; do
+    # public ip
+    ip=$(echo_ip "$sn" 1)
+
+    echo "Adding $ip to host $SR_INTF"
+    sudo ip addr add "$ip" dev "$SR_INTF"
+    gws+=("${ip%/*}")
+  done
+  sudo ip link set "$SR_INTF" up
+
+  for sn in "$@"; do
+    # link ip
+    ip=$(echo_ip "$sn" 2)
+
+    echo "Adding $ip to rootless $SR_INTF"
+    podman unshare --rootless-netns <<- EOF
+	ip addr add "$ip" dev "$SR_INTF" && ip link set "$SR_INTF" up
+	EOF
+
+    for gw in "${gws[@]}"; do
+      if [[ $ip =~ : ]]; then
+        [[ $gw =~ : ]] && break
+      elif [[ ! $gw =~ : ]]; then
+        break
+      fi
+      gw=''
+    done
+    [[ $gw ]] || continue
+    echo "Adding default route via $gw dev $SR_INTF to rootless"
+    podman unshare --rootless-netns ip route \
+           add default via "$gw" dev "$SR_INTF"
+  done
+}
+
+setup_links() { # [ <names>...]
+  local name n sn=() rsn=() ips=() ip args=()
+
+  for name in "$@"; do
+    podman &>/dev/null network inspect "$name" ||
+      die "Podman network $name not found"
+  done
+
+  podman &>/dev/null network inspect "$SR_NET" || {
+    echo "Creating network $SR_NET"
+    podman >/dev/null network create --ipv6 "$SR_NET"
+  }
+
+  get_subnets sn "$SR_NET"
+
+  setup_gw "${sn[@]}"
+
+  for n in "${sn[@]}"; do
+    ip=$(echo_ip "$n" 2)
+    ips+=("${ip%/*}")
+  done
+
+  for name in "$@"; do
+    get_subnets rsn "$name"
+    for n in "${rsn[@]}"; do
+      [[ $n =~ : ]] && args=(-6) || args=()
+      [[ $(ip 2>/dev/null "${args[@]}" route list "$n" dev "$SR_INTF") ]] &&
+        continue
+
+      for ip in "${ips[@]}"; do
+        if [[ $ip =~ : ]]; then
+          [[ $n =~ : ]] && break
+        elif [[ ! $n =~ : ]]; then
+          break
+        fi
+        ip=''
+      done
+      [[ $ip ]] || continue
+      echo "Adding host route $n via $ip dev $SR_INTF for network $name"
+      sudo ip route add "$n" via "$ip" dev "$SR_INTF"
+    done
+  done
+}
+
+rm_links() { # <names>...
+  local name sn=() n ip args=()
+
+  if [[ $1 ]]; then
+    for name in "$@"; do
+      get_subnets sn "$name"
+      for n in "${sn[@]}"; do
+        [[ $n =~ : ]] && args=(-6) || args=()
+        [[ $(ip 2>/dev/null "${args[@]}" route list "$n" dev "$SR_INTF") ]] ||
+          continue
+        echo "Removing host route $n dev $SR_INTF for network $name"
+        sudo ip route del "$n" dev "$SR_INTF"
+      done
+    done
+  else
+
+    ip &>/dev/null link show "$SR_INTF" && {
+      echo "Removing rootless link $SR_INTF"
+      podman unshare --rootless-netns ip 2>/dev/null link del "$SR_INTF"
+    }
+
+    podman &>/dev/null pod inspect "$SR_INFRA" && {
+      echo "Removing pod $SR_INFRA"
+      podman >/dev/null pod stop "$SR_INFRA" || :
+      podman >/dev/null pod rm "$SR_INFRA"
+    }
+
+    podman &>/dev/null network inspect "$SR_NET" && {
+      echo "Removing podman network $SR_NET"
+      podman >/dev/null network rm "$SR_NET"
+    }
+  fi
+}
+
+usage() {
+  echo "Setup public routing for podman network <name>"
+  echo "Usage: ${0##*/} [ -r ] <name> | -x | -h"
+  echo "Options:"
+  echo " -h - show help"
+  echo " -r - remove (all if no <name>)"
+}
+
+REMOVE=
+while [[ $1 ]]; do
+  case $1 in
+    -r) REMOVE=1;;
+    -h|--help) usage; exit;;
+    -*) err "Option $1 unknown"; usage; exit 1;;
+    *) break;;
+  esac
+  shift
+done
+
+[[ $UID == 0 ]] && die "Script applies to rootless podman networks (not root)"
+
+if [[ $REMOVE ]]; then
+  rm_links "$@"
+else
+  setup_links "$@"
+fi
