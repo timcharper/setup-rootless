@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: LGPL-3.0-or-later
 #
-# Copyright (C) 2025 Scott Shambarger v0.1.0
+# Copyright (C) 2025 Scott Shambarger v0.2.0
 #
 # TODO:
 #   SR_INTF: support patterns
-#   SR_NET: use network interface name for links
-#   SR_NET: use gateway ip rather than 1 and 2
 #   SR_NET: honor mtu/metric/no_default_route/routes
 #
 # Script to create publically routable rootless podman networks
@@ -74,28 +72,31 @@ for cmd in jq ip podman sudo; do
   command >/dev/null -v "$cmd" || die "$cmd command not found"
 done
 
-# set <var> array to <name>'s subnets
+# set <var> array to <name>'s '<gateway>/<mask>'
 get_subnets() { # <var> <name>
   readarray -t "$1" < <(podman network inspect "$2" | \
-                        jq -r '.[0].subnets.[].subnet') || :
+                          jq -r '.[0].subnets[]|.gateway+"/"+(.subnet|split("/")[1])') || :
   [[ $sn ]] || die "Unable to find subnet for network $2"
 }
 
-echo_ip() { # <ip> <quad>
+modify_ip() { # <ip> <quad>
   if [[ $1 =~ : ]]; then
-    echo "${1%/*}$2/${1#*/}"
+    echo "${1%::*}::$2/${1#*/}"
   else
     echo "${1%.*}.$2/${1#*/}"
   fi
 }
 
-setup_gw() { # <subnet>...
-  local ip pid lns sn gw gws args=()
+setup_gw() { # "<gateway>/<mask>"...
+  local ip pid lns gw args=()
 
   podman &>/dev/null inspect "$SR_INFRA" || {
     echo "Creating pod $SR_INFRA to hold rootless netns"
     # Use default network, $SR_NET needs to be unused by pasta"
     podman >/dev/null pod create --name "$SR_INFRA" --network podman
+  }
+  [[ $(podman pod ps -n -f status=running -f name="$SR_INFRA") ]] || {
+    echo "Starting pod $SR_INFRA..."
     podman >/dev/null pod start "$SR_INFRA"
   }
 
@@ -110,68 +111,84 @@ setup_gw() { # <subnet>...
     break
   done < <(podman unshare --rootless-netns sh -c 'echo $$; sleep 2')
 
+  local reset=1
   ip &>/dev/null link show "$SR_INTF" && {
-    for sn in "$@"; do
-      [[ $sn =~ : ]] && args=(-6) || args=(-4)
+    reset=
+    for gw in "$@"; do
+      [[ $gw =~ : ]] && args=(-6) || args=(-4)
       ip=$(ip 2>/dev/null "${args[@]}" -j addr show dev "$SR_INTF" |
              jq -r '.[0].addr_info[0] | .local + "/" + (.prefixlen|tostring)')
-      sn=$(echo_ip "$sn" 1)
-      [[ $sn == "$ip" ]] || {
-        echo "$SR_INTF is $ip, should be $sn - resetting"
-        pid=''
+      [[ $gw == "$ip" ]] || {
+        echo "Host $SR_INTF has $ip, should be $gw - resetting"
+        reset=1
       }
     done
-    [[ $pid ]] && return
   }
 
-  # remove any existing link, add new one
-  echo "Creating link+peer $SR_INTF in rootless netns"
-  podman unshare --rootless-netns <<- EOF
+  [[ $reset ]] && {
+    # remove any existing link, add new one
+    echo "Creating link+peer $SR_INTF in rootless netns"
+    podman unshare --rootless-netns <<- EOF
 	ip 2>/dev/null link del "$SR_INTF"
 	ip link add "$SR_INTF" type veth peer name "${SR_INTF}-peer"
 	EOF
 
-  # check host $SR_INTF was removed
-  ip &>/dev/null link show "$SR_INTF" &&
-    die "Host link $SR_INTF used by something other an rootless link $SR_INTF"
+    # check host $SR_INTF was removed
+    ip &>/dev/null link show "$SR_INTF" &&
+      die "Host link $SR_INTF used by something other an rootless link $SR_INTF"
 
-  lns=$(ip netns identify $$)
-  [[ $lns ]] || die "Unable to discover name of default network namespace"
-  echo "Moving $SR_INTF peer to host"
-  sudo ip -n "$SR_NS" link set "${SR_INTF}-peer" name "$SR_INTF" netns "$lns"
+    lns=$(ip netns identify $$)
+    [[ $lns ]] || die "Unable to discover name of default network namespace"
+    echo "Moving $SR_INTF peer to host"
+    sudo ip -n "$SR_NS" link set "${SR_INTF}-peer" name "$SR_INTF" netns "$lns"
+  }
 
-  for sn in "$@"; do
-    # public ip
-    ip=$(echo_ip "$sn" 1)
-
-    echo "Adding $ip to host $SR_INTF"
-    sudo ip addr add "$ip" dev "$SR_INTF"
-    gws+=("${ip%/*}")
-  done
   sudo ip link set "$SR_INTF" up
+  podman unshare --rootless-netns ip link set "$SR_INTF" up
 
-  for sn in "$@"; do
+  for gw in "$@"; do
+    ip -j addr show dev "$SR_INTF" |
+      jq -r '.[0].addr_info[]|select(.scope=="global")|.local+"/"+(.prefixlen|tostring)' |
+      grep -q "^$gw\$" || {
+      echo "Adding $gw to host $SR_INTF"
+      sudo ip addr add "$gw" dev "$SR_INTF"
+    }
+  done
+
+  for gw in "$@"; do
     # link ip
-    ip=$(echo_ip "$sn" 2)
+    ip=$(modify_ip "$gw" 2)
 
-    echo "Adding $ip to rootless $SR_INTF"
     podman unshare --rootless-netns <<- EOF
-	ip addr add "$ip" dev "$SR_INTF" && ip link set "$SR_INTF" up
+	ip -j addr show dev "$SR_INTF" |
+	  jq -r '.[0].addr_info[]|select(.scope=="global").local' |
+	  grep -q "^${ip%/*}\$" && exit
+	echo "Adding $ip to rootless $SR_INTF"
+	ip addr add "$ip" dev "$SR_INTF"
 	EOF
 
-    for gw in "${gws[@]}"; do
-      if [[ $ip =~ : ]]; then
-        [[ $gw =~ : ]] && break
-      elif [[ ! $gw =~ : ]]; then
-        break
-      fi
-      gw=''
-    done
-    [[ $gw ]] || continue
-    echo "Adding default route via $gw dev $SR_INTF to rootless"
-    podman unshare --rootless-netns ip route \
-           add default via "$gw" dev "$SR_INTF"
+    gw=${gw%/*}
+    [[ $gw =~ : ]] && args=(-6) || args=(-4)
+    podman unshare --rootless-netns <<- EOF
+	ip "${args[@]}" -j route show dev "$SR_INTF" |
+	  jq -r '.[]|select(.dst=="default").gateway' |
+	  grep -q "$gw" && exit
+	echo "Adding default route via $gw dev $SR_INTF to rootless"
+	ip route add default via "$gw" dev "$SR_INTF"
+	EOF
   done
+
+  # podman adds 169.254.1.1 to resolv.conf, so direct it to pasta
+  podman unshare --rootless-netns <<-EOF
+	ip -j route show | jq -r '.[] | .dst' | grep -q "169.254.1.1" && exit
+	dev=\$(ip -j route show | jq -r '.[] | select(.dst=="default").dev' | \
+	  grep -v "$SR_INTF")
+	[ -n "\$dev" ] || { \
+	  echo >&2 "Unable to find device for default route in rootless"; \
+	  exit 1; }
+	echo "Adding route for 169.254.1.1 to \$dev"
+	ip route add 169.254.1.1 dev "\$dev"
+	EOF
 }
 
 setup_links() { # [ <names>...]
@@ -184,7 +201,7 @@ setup_links() { # [ <names>...]
 
   podman &>/dev/null network inspect "$SR_NET" || {
     echo "Creating network $SR_NET"
-    podman >/dev/null network create --ipv6 "$SR_NET"
+    podman >/dev/null network create --ipv6 --disable-dns "$SR_NET"
   }
 
   get_subnets sn "$SR_NET"
@@ -192,7 +209,7 @@ setup_links() { # [ <names>...]
   setup_gw "${sn[@]}"
 
   for n in "${sn[@]}"; do
-    ip=$(echo_ip "$n" 2)
+    ip=$(modify_ip "$n" 2)
     ips+=("${ip%/*}")
   done
 
@@ -212,6 +229,7 @@ setup_links() { # [ <names>...]
         ip=''
       done
       [[ $ip ]] || continue
+      n=$(modify_ip "$n" 0)
       echo "Adding host route $n via $ip dev $SR_INTF for network $name"
       sudo ip route add "$n" via "$ip" dev "$SR_INTF"
     done
@@ -224,6 +242,7 @@ rm_network() { # <name>
   get_subnets sn "$name"
 
   for n in "${sn[@]}"; do
+    n=$(modify_ip "$n" 0)
     [[ $n =~ : ]] && args=(-6) || args=()
     [[ $(ip 2>/dev/null "${args[@]}" route list "$n" dev "$SR_INTF") ]] ||
       continue

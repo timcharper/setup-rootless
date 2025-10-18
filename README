@@ -53,6 +53,8 @@ Theory:
   the network named in $SR_NET, and adds a default route to the host
   peer for the rootless network.
 
+  A specific route for 169.254.1.1 is added to support pasta's DNS entry
+
   Finally, for any supplied podman network, it adds a host route to
   the rootless peer.
 
